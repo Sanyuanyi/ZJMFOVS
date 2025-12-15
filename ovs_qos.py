@@ -34,7 +34,7 @@ OVS_VSCTL = os.environ.get("OVS_VSCTL", "ovs-vsctl")
 # 命令超时（秒）
 OVS_TIMEOUT = 10
 
-# 默认配置，可以被 /opt/ovs-qos/config.json 覆盖
+# 默认配置，可以被 /opt/ovs-qos/config.json 配置文件覆盖
 DEFAULT_CONFIG: Dict[str, Any] = {
     "base_rate_mbit": 1000,
     "iface_name_regexes": [r"^kvm[0-9]+\..*$"],  # 修复：单反斜杠转义点号
