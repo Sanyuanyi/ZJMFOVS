@@ -1,0 +1,15 @@
+{
+    "base_rate_mbit": 200,
+    "iface_name_regexes": [r"^kvm[0-9]+\..*$"],  # 修复：单反斜杠转义点号
+    "sample_interval_sec": 60,  # 默认 1 分钟，可通过 config.json 覆盖
+    # Stage 1 默认参数（可通过 config.json 调整）
+    "stage1_usage_fraction": 0.90,
+    "stage1_trigger_seconds": 900,
+    "stage1_rate_fraction": 0.90,
+    "stage1_penalty_seconds": 1800,
+    # Stage 2 默认参数
+    "stage2_usage_fraction": 0.80,
+    "stage2_trigger_seconds": 1800,
+    "stage2_rate_fraction": 0.80,
+    "stage2_penalty_seconds": 3600,
+}
