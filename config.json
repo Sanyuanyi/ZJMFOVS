@@ -1,5 +1,5 @@
 {
-    "base_rate_mbit": 200,
+    "base_rate_mbit": 1000,
     "iface_name_regexes": [r"^kvm[0-9]+\..*$"],  # 修复：单反斜杠转义点号
     "sample_interval_sec": 60,  # 默认 1 分钟，可通过 config.json 覆盖
     # Stage 1 默认参数（可通过 config.json 调整）
