@@ -1,0 +1,13 @@
+{
+  "base_rate_mbit": 1000,
+  "iface_name_regexes": ["^kvm[0-9]+\\..*$"],
+  "sample_interval_sec": 60,
+  "stage1_usage_fraction": 0.9,
+  "stage1_trigger_seconds": 900,
+  "stage1_rate_fraction": 0.9,
+  "stage1_penalty_seconds": 1800,
+  "stage2_usage_fraction": 0.8,
+  "stage2_trigger_seconds": 1700,
+  "stage2_rate_fraction": 0.8,
+  "stage2_penalty_seconds": 3600
+}
