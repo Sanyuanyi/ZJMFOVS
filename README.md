@@ -21,7 +21,8 @@
    - Stage1→2：占用率 ≥ `stage2_usage_fraction` 持续 `stage2_trigger_seconds`，限速为基准 × `stage2_rate_fraction`。
    - 惩罚期到期自动恢复至基准带宽。
    - 判断始终基于“基准带宽”，与当前限速无关（避免阶梯叠加误判）。
-4. 下发限速：调用 `ovs-vsctl set interface ... ingress_policing_rate/burst`。`burst` 规则：`max(10%速率, 2000kb)` 且不超过 1 秒带宽，防止过度突发或过小 MTU 影响。
+   - 如希望稳定从Stage1在满足Stage2处罚条件时自动切换而不是解除触发重新计时并进入Stage1，请确保Stage2触发时间低于stage1惩罚时间最少10秒。
+4. 下发限速：调用 `ovs-vsctl set interface ... ingress_policing_rate/burst`。`burst` 规则：`永远为 10%速率`，防止burst过小造成TCP严重丢包。
 5. 状态持久化：接口新增/删除、阶段切换、计时器重置等变化时写 `/run/ovs-qos/state.json`，并在守护进程重启或采样中断后自动清零过期计时防止误罚。
 6. CLI 查询：`python3 ovs_qos.py list` 查看各接口当前阶段、限速、剩余惩罚时间和上一采样 Mbps。
 
@@ -42,7 +43,7 @@
 `stage1_rate_fraction` | 0.9 | Stage1 限速占基准带宽的比例。
 `stage1_penalty_seconds` | 1800 | Stage1 惩罚持续时间。
 `stage2_usage_fraction` | 0.8 | Stage2 触发占用率阈值（同样基于基准带宽）。
-`stage2_trigger_seconds` | 1800 | Stage2 连续超用触发时长。
+`stage2_trigger_seconds` | 1700 | Stage2 连续超用触发时长。
 `stage2_rate_fraction` | 0.8 | Stage2 限速占基准带宽的比例。
 `stage2_penalty_seconds` | 3600 | Stage2 惩罚持续时间。
 
@@ -59,7 +60,7 @@
    "stage1_rate_fraction": 0.9,
    "stage1_penalty_seconds": 1800,
    "stage2_usage_fraction": 0.8,
-   "stage2_trigger_seconds": 1800,
+   "stage2_trigger_seconds": 1700,
    "stage2_rate_fraction": 0.8,
    "stage2_penalty_seconds": 3600
 }
