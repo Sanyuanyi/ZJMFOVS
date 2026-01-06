@@ -20,7 +20,7 @@ import time
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # 路径约定：所有机器统一
 CONFIG_PATH = "/opt/ovs-qos/config.json"
@@ -37,17 +37,15 @@ OVS_TIMEOUT = 10
 # 默认配置，可以被 /opt/ovs-qos/config.json 配置文件覆盖
 DEFAULT_CONFIG: Dict[str, Any] = {
     "base_rate_mbit": 1000,
-    "iface_name_regexes": [r"^kvm[0-9]+\..*$"],  # 修复：单反斜杠转义点号
-    "sample_interval_sec": 60,  # 默认 1 分钟，可通过 config.json 覆盖
-    # Stage 1 默认参数（可通过 config.json 调整）
-    "stage1_usage_fraction": 0.90,
+    "iface_name_regexes": [r"^kvm[0-9]+\..*$"],
+    "sample_interval_sec": 60,
+    "stage1_usage_fraction": 0.9,
     "stage1_trigger_seconds": 900,
-    "stage1_rate_fraction": 0.90,
+    "stage1_rate_fraction": 0.9,
     "stage1_penalty_seconds": 1800,
-    # Stage 2 默认参数
-    "stage2_usage_fraction": 0.80,
-    "stage2_trigger_seconds": 1800,
-    "stage2_rate_fraction": 0.80,
+    "stage2_usage_fraction": 0.8,
+    "stage2_trigger_seconds": 1700,
+    "stage2_rate_fraction": 0.8,
     "stage2_penalty_seconds": 3600,
 }
 
@@ -61,6 +59,20 @@ def _as_number(value: Any) -> Optional[float]:
     if isinstance(value, (int, float)):
         return float(value)
     return None
+
+
+def _as_int(value: Any) -> Optional[int]:
+    num = _as_number(value)
+    if num is None:
+        return None
+    return int(num)
+
+
+def _as_float(value: Any) -> Optional[float]:
+    num = _as_number(value)
+    if num is None:
+        return None
+    return float(num)
 
 
 def validate_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -182,6 +194,12 @@ def run_ovs_vsctl(args: List[str]) -> Optional[Dict[str, Any]]:
             stderr=subprocess.STDOUT,
             timeout=OVS_TIMEOUT,
         )
+    except FileNotFoundError:
+        logging.error("ovs-vsctl not found: %s", OVS_VSCTL)
+        return None
+    except OSError as e:
+        logging.error("ovs-vsctl OS error (cmd=%s): %s", " ".join(cmd), e)
+        return None
     except subprocess.TimeoutExpired:
         logging.error("ovs-vsctl timed out after %ds: %s", OVS_TIMEOUT, " ".join(cmd))
         return None
@@ -336,6 +354,75 @@ def load_state() -> Dict[str, Any]:
         return {}
 
 
+def sanitize_state(raw: Any) -> Tuple[Dict[str, Dict[str, Any]], bool]:
+    """清理 state 结构，避免坏数据导致守护进程崩溃。"""
+    if not isinstance(raw, dict):
+        logging.error("State file must be a JSON object, ignoring")
+        return {}, True
+
+    dirty = False
+    sanitized: Dict[str, Dict[str, Any]] = {}
+    for name, st in raw.items():
+        if not isinstance(name, str) or not isinstance(st, dict):
+            dirty = True
+            continue
+
+        stage = _as_int(st.get("stage"))
+        if stage not in (0, 1, 2):
+            stage = 0
+            dirty = True
+
+        stage_until = _as_float(st.get("stage_until"))
+        if stage_until is None or stage_until < 0:
+            stage_until = 0.0
+            dirty = True
+
+        cond1_start = _as_float(st.get("cond1_start"))
+        if cond1_start is None or cond1_start <= 0:
+            cond1_start = None
+            if st.get("cond1_start") not in (None, 0, 0.0):
+                dirty = True
+
+        cond2_start = _as_float(st.get("cond2_start"))
+        if cond2_start is None or cond2_start <= 0:
+            cond2_start = None
+            if st.get("cond2_start") not in (None, 0, 0.0):
+                dirty = True
+
+        last_rx_bytes = _as_int(st.get("last_rx_bytes"))
+        if last_rx_bytes is None or last_rx_bytes < 0:
+            last_rx_bytes = 0
+            dirty = True
+
+        last_ts = _as_float(st.get("last_ts"))
+        if last_ts is None or last_ts < 0:
+            last_ts = 0.0
+            dirty = True
+
+        last_mbps = _as_float(st.get("last_mbps"))
+        if last_mbps is None or last_mbps < 0:
+            last_mbps = 0.0
+            dirty = True
+
+        current_rate_kbps = _as_int(st.get("current_rate_kbps"))
+        if current_rate_kbps is None or current_rate_kbps < 0:
+            current_rate_kbps = 0
+            dirty = True
+
+        sanitized[name] = {
+            "stage": stage,
+            "stage_until": stage_until,
+            "cond1_start": cond1_start,
+            "cond2_start": cond2_start,
+            "last_rx_bytes": last_rx_bytes,
+            "last_ts": last_ts,
+            "last_mbps": last_mbps,
+            "current_rate_kbps": current_rate_kbps,
+        }
+
+    return sanitized, dirty
+
+
 def save_state(state: Dict[str, Any]) -> None:
     """原子方式写入状态文件，防止中途写坏。"""
     try:
@@ -418,7 +505,11 @@ def daemon_loop() -> None:
     """主循环：采样流量、更新阶段、下发限速。"""
     global _compiled_regexes
 
-    setup_logging()
+    try:
+        setup_logging()
+    except Exception:
+        logging.basicConfig(level=logging.INFO)
+        logging.warning("Failed to initialize file logging; using stderr")
     lock_file = acquire_lock()  # noqa: F841 保持引用
     logging.info("ovs-qos daemon starting (pid=%d)", os.getpid())
 
@@ -445,8 +536,18 @@ def daemon_loop() -> None:
     stage2_penalty = cfg["stage2_penalty_seconds"]
 
     state = load_state()
+    state, state_sanitized = sanitize_state(state)
+    state_dirty = state_sanitized
+    if state_sanitized:
+        logging.warning("State file sanitized on startup")
+
     if sync_state_rates_on_start(state, base_rate_kbps, stage1_rate_frac, stage2_rate_frac):
+        state_dirty = True
+
+    last_state_save_ts = 0.0
+    if state_dirty:
         save_state(state)
+        last_state_save_ts = now_ts()
 
     while True:
         state_dirty = False
@@ -578,8 +679,9 @@ def daemon_loop() -> None:
             st["cond1_start"] = cond1_start
             st["cond2_start"] = cond2_start
 
-        if state_dirty:
+        if state_dirty or ts - last_state_save_ts >= interval:
             save_state(state)
+            last_state_save_ts = ts
         time.sleep(interval)
 
 
@@ -601,16 +703,22 @@ def format_remaining(ts: Optional[float]) -> str:
     return str(int(remaining))
 
 
-def compute_live_mbps(st: Dict[str, Any], rx_bytes: int, now_ts: float) -> float:
-    last_ts = st.get("last_ts")
-    last_rx = st.get("last_rx_bytes")
-    if isinstance(last_ts, (int, float)) and isinstance(last_rx, int) and now_ts > last_ts:
-        diff_bytes = rx_bytes - last_rx
-        if diff_bytes < 0:
-            diff_bytes = 0
-        bps = diff_bytes * 8.0 / (now_ts - last_ts)
-        return bps / 1e6
-    return float(st.get("last_mbps", 0.0) or 0.0)
+def compute_live_mbps(prev_bytes: int, curr_bytes: int, delta_sec: float) -> float:
+    if delta_sec <= 0:
+        return 0.0
+    diff_bytes = curr_bytes - prev_bytes
+    if diff_bytes < 0:
+        diff_bytes = 0
+    bps = diff_bytes * 8.0 / delta_sec
+    return bps / 1e6
+
+
+def read_iface_rx_bytes(name: str) -> Optional[int]:
+    path = Path("/sys/class/net") / name / "statistics" / "rx_bytes"
+    try:
+        return int(path.read_text().strip())
+    except (FileNotFoundError, ValueError, OSError):
+        return None
 
 
 def cmd_list() -> None:
@@ -640,23 +748,87 @@ def cmd_list() -> None:
         print("No matching interfaces.")
         return
 
+    sample_start = time.time()
+    rx_bytes_start: Dict[str, int] = {}
+    for name in vm_ifaces.keys():
+        rx_val = read_iface_rx_bytes(name)
+        if isinstance(rx_val, int):
+            rx_bytes_start[name] = rx_val
+    time.sleep(1)
+    sample_end = time.time()
+    rx_bytes_end: Dict[str, int] = {}
+    for name in vm_ifaces.keys():
+        rx_val = read_iface_rx_bytes(name)
+        if isinstance(rx_val, int):
+            rx_bytes_end[name] = rx_val
+
+    sample_delta = max(sample_end - sample_start, 0.001)
+    live_mbps_by_iface: Dict[str, Optional[float]] = {}
+    missing_for_live: List[str] = []
+    for name in vm_ifaces.keys():
+        if name in rx_bytes_start and name in rx_bytes_end:
+            live_mbps_by_iface[name] = compute_live_mbps(
+                rx_bytes_start[name],
+                rx_bytes_end[name],
+                sample_delta,
+            )
+        else:
+            live_mbps_by_iface[name] = None
+            missing_for_live.append(name)
+
+    if missing_for_live:
+        all_ifaces_live = get_interfaces()
+        if all_ifaces_live is None:
+            logging.error("Failed to query OVS interfaces for live sample fallback")
+        else:
+            vm_ifaces_live = filter_vm_interfaces(all_ifaces_live, regexes)
+            for name in missing_for_live:
+                live_info = vm_ifaces_live.get(name)
+                if not live_info:
+                    continue
+                live_mbps_by_iface[name] = compute_live_mbps(
+                    vm_ifaces[name].get("rx_bytes", 0),
+                    live_info.get("rx_bytes", 0),
+                    sample_delta,
+                )
+
     state = load_state()
+    state, state_sanitized = sanitize_state(state)
+    if state_sanitized:
+        logging.warning("State file invalid or incomplete; list output may be partial")
     if not state:
         logging.warning("State file missing or empty; stage/penalty info may be incomplete")
 
-    header = "{:<18} {:<6} {:<10} {:<22} {:<12} {:<10}".format(
-        "Interface", "Stage", "Limit(M)", "Penalty_Until", "Remaining(s)", "Last_Mbps"
+    now = time.time()
+    state_path = Path(STATE_PATH)
+    if state_path.exists():
+        try:
+            state_mtime = state_path.stat().st_mtime
+            if now - state_mtime > interval * 2:
+                logging.warning(
+                    "State file update is stale (mtime=%s); daemon may not be saving state",
+                    format_local_time(state_mtime),
+                )
+        except OSError as e:
+            logging.warning("Failed to stat state file %s: %s", STATE_PATH, e)
+    else:
+        logging.warning("State file missing; daemon may not be saving state")
+
+    header = "{:<18} {:<6} {:<10} {:<22} {:<12} {:<10} {:<10}".format(
+        "Interface", "Stage", "Limit(M)", "Penalty_Until", "Remaining(s)", "Last_Mbps", "Live_Mbps"
     )
     print(header)
     print("-" * len(header))
 
-    now = time.time()
     for name in sorted(vm_ifaces.keys()):
         st = state.get(name, {})
         info = vm_ifaces[name]
         stage_until = st.get("stage_until", 0.0)
         limit_m = info.get("ingress_policing_rate", 0) / 1000.0
-        live_mbps = compute_live_mbps(st, info.get("rx_bytes", 0), now)
+        last_mbps = st.get("last_mbps")
+        last_mbps_str = "{:.2f}".format(last_mbps) if isinstance(last_mbps, (int, float)) else "-"
+        live_mbps = live_mbps_by_iface.get(name)
+        live_mbps_str = "{:.2f}".format(live_mbps) if isinstance(live_mbps, (int, float)) else "-"
         last_ts = st.get("last_ts")
         if isinstance(last_ts, (int, float)):
             if now - last_ts > interval * 2:
@@ -667,13 +839,14 @@ def cmd_list() -> None:
                 )
         else:
             logging.warning("State sample for %s missing; Last_Mbps may be inaccurate", name)
-        print("{:<18} {:<6} {:<10} {:<22} {:<12} {:<10.2f}".format(
+        print("{:<18} {:<6} {:<10} {:<22} {:<12} {:<10} {:<10}".format(
             name,
             st.get("stage", 0),
             limit_m,
             format_local_time(stage_until) if stage_until else "-",
             format_remaining(stage_until),
-            live_mbps,
+            last_mbps_str,
+            live_mbps_str,
         ))
 
 
